@@ -10,6 +10,8 @@ from comment_extractor import YouTubeCommentExtractor
 from pipeline import CachedAnalysisPipeline
 
 def main():
+    from retention import enforce_retention
+    enforce_retention(os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"))
     print("\n" + "!"*60)
     print(" DISCLAIMER: This tool is for educational/research purposes only.")
     print(" Users are responsible for complying with YouTube's Terms of Service.")

@@ -88,13 +88,14 @@ class NotebookLMExporter:
                 comments_md = f"# Audience Comments Dataset for {self.brand_name}\n\n"
                 comments_md += f"Total Comments: {len(comments_df)}\n\n"
                 
-                cols = [c for c in ['video_title', 'author', 'comment_text', 'like_count', 'published_at'] if c in comments_df.columns]
+                cols = [c for c in ['video_title', 'comment_text', 'like_count', 'published_at'] if c in comments_df.columns]
                 # Process top comments in chunks/sample to stay concise
                 sample_comments = comments_df[cols].head(200) if not comments_df.empty else comments_df
                 
-                for idx, row in sample_comments.iterrows():
+                comments_md += "_Nomes fictícios (User A, User B…) criados para preservar a privacidade dos usuários._\n\n"
+                for n_row, (idx, row) in enumerate(sample_comments.iterrows()):
                     v_title = row.get('video_title', 'Video')
-                    author = row.get('author', 'User')
+                    author = f"User {n_row + 1}"
                     text = row.get('comment_text', '')
                     likes = row.get('like_count', 0)
                     comments_md += f"- **[{v_title}] {author}** ({likes} likes): {text}\n"
