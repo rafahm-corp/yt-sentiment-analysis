@@ -1,0 +1,501 @@
+# ==============================================================================
+# YOUTUBE BRAND CRAWLER
+# ==============================================================================
+# This script intelligently searches YouTube for relevant user-generated
+# content about a specific brand or product, filtering out ads and official
+# content to provide a list of the most viewed or engaging videos.
+#
+# How it works:
+# 1. Reads a search query and filtering criteria from config.ini.
+# 2. Performs multiple targeted searches using modifiers (e.g., "review").
+# 3. Fetches detailed video statistics for each search result.
+# 4. Filters out videos that don't meet the criteria (e.g., low views, ads).
+# 5. Applies two-stage relevance filtering (deterministic heuristics + Gemini AI).
+# 6. Calculates an engagement score for each video.
+# 7. Sorts the results by the desired metric (relevance, views, engagement, date).
+# 8. Saves the final, curated list to a CSV file in a brand-specific folder.
+# ==============================================================================
+
+import os
+import configparser
+import pandas as pd
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from dotenv import load_dotenv
+import re
+from tqdm import tqdm
+from datetime import datetime
+import requests
+import json
+import hashlib
+import time
+
+try:
+    from src.semantic_filter import VideoRelevanceFilter
+except ImportError:
+    from semantic_filter import VideoRelevanceFilter
+
+
+class YouTubeBrandCrawler:
+    """
+    A class to crawl YouTube for brand-related user-generated content.
+    """
+    def __init__(self, config_path=None, env_path=None):
+        """Initializes the crawler by loading configuration and API keys."""
+        print("Initializing YouTube Brand Crawler...")
+        
+        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        if config_path is None:
+            config_path = os.path.join(self.project_root, 'config.ini')
+        if env_path is None:
+            env_path = os.path.join(self.project_root, '.env')
+            
+        self.config_path = config_path
+        self.env_path = env_path
+        self._load_environment_variables(env_path)
+        self._load_configuration(config_path)
+        self.youtube_api = build("youtube", "v3", developerKey=self.youtube_api_key)
+
+    def _load_environment_variables(self, env_path):
+        """Loads API keys from environment or .env file."""
+        load_dotenv(dotenv_path=env_path)
+        self.youtube_api_key = os.getenv("YOUTUBE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not self.youtube_api_key:
+            print("Warning: Neither YOUTUBE_API_KEY nor GEMINI_API_KEY found in env.")
+        else:
+            print("SUCCESS: Environment variables loaded.")
+
+    def _load_configuration(self, config_path):
+        """Loads settings from the [Crawler] and [Analysis] sections of config.ini."""
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Configuration file not found at {config_path}")
+        
+        self.config_path = config_path
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(config_path)
+        
+        self.search_terms = config.get('Crawler', 'search_terms', fallback='')
+        search_queries_str = config.get('Crawler', 'search_queries', fallback='')
+        self.search_queries = [q.strip() for q in search_queries_str.split(';') if q.strip()]
+        self.search_modifiers = [mod.strip() for mod in config.get('Crawler', 'search_modifiers', fallback='').split(',') if mod.strip()]
+        self.exclude_keywords = [key.strip().lower() for key in config.get('Crawler', 'exclude_keywords', fallback='').split(',') if key.strip()]
+        
+        # New filters
+        self.video_type = config.get('Crawler', 'video_type', fallback='both').lower()
+        self.published_after = config.get('Crawler', 'published_after', fallback='').strip()
+        self.region_code = config.get('Crawler', 'region_code', fallback='US').strip().upper()
+        
+        # Context & Config Loading (Chunk 3)
+        self.additional_context = config.get('Analysis', 'additional_context', fallback='')
+        self.campaign_briefing = config.get('Crawler', 'campaign_briefing', fallback=self.search_terms)
+        if not self.campaign_briefing.strip():
+            self.campaign_briefing = self.search_terms
+        self.enable_semantic_filter = config.getboolean('Crawler', 'enable_semantic_filter', fallback=True)
+        self.relevance_threshold = config.getint('Crawler', 'relevance_threshold', fallback=70)
+        
+        # Format published_after to RFC 3339 if present
+        if self.published_after:
+            try:
+                # Try parsing full ISO format first
+                dt = datetime.fromisoformat(self.published_after.replace('Z', '+00:00'))
+                self.published_after = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            except ValueError:
+                try:
+                    # Try YYYY-MM-DD format and append time
+                    dt = datetime.strptime(self.published_after, "%Y-%m-%d")
+                    self.published_after = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                except ValueError:
+                     print(f"WARNING: Invalid date format for 'published_after' ({self.published_after}). Ignoring filter.")
+                     self.published_after = None
+
+        include_str = config.get('Crawler', 'include_channels', fallback='')
+        self.include_channels = [ch.strip().lower() for ch in include_str.split(',') if ch.strip()]
+        
+        exclude_str = config.get('Crawler', 'exclude_channels', fallback='')
+        self.exclude_channels = [ch.strip().lower() for ch in exclude_str.split(',') if ch.strip()]
+
+        self.min_view_count = config.getint('Crawler', 'min_view_count', fallback=0)
+        self.sort_by = config.get('Crawler', 'sort_by', fallback='relevance')
+        self.max_results = config.getint('Crawler', 'max_results', fallback=20)
+
+        # --- Brand-Specific Output Path (BUG FIX) ---
+        safe_brand_name = re.sub(r'\W+', '', self.search_terms.replace(' ', '_'))
+        run_id = config.get('General', 'run_id', fallback=safe_brand_name)
+        self.output_dir = os.path.join(self.project_root, 'outputs', run_id)
+        self.output_path = os.path.join(self.output_dir, f"{safe_brand_name}_discovered_videos.csv")
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        print(f"SUCCESS: Configuration loaded for brand '{self.search_terms}'.")
+        if self.video_type != 'both':
+            print(f"Filtering for video type: {self.video_type}")
+        if self.published_after:
+            print(f"Filtering for videos published after: {self.published_after}")
+        print(f"Semantic Filter Enabled: {self.enable_semantic_filter} (Threshold: {self.relevance_threshold})")
+        print(f"Output will be saved to '{self.output_path}'")
+
+    def run_crawler(self):
+        """Executes the full crawling and filtering pipeline."""
+        print("\n▶️  Starting video search on YouTube...")
+        
+        if hasattr(self, 'search_queries') and self.search_queries:
+            active_queries = self.search_queries
+            print(f"Executing {len(active_queries)} AI-generated search queries: {active_queries}")
+        else:
+            combined_modifiers = " | ".join(self.search_modifiers)
+            if combined_modifiers:
+                active_queries = [f'"{self.search_terms}" ({combined_modifiers})']
+            else:
+                active_queries = [self.search_terms]
+            print(f"Executing search query: '{active_queries[0]}'")
+        
+        target_channel_ids = []
+        if self.include_channels:
+            print(f"Resolving channel IDs for targeted search ({len(self.include_channels)} channels)...")
+            for ch_name in self.include_channels:
+                try:
+                    ch_resp = self.youtube_api.search().list(q=ch_name, type="channel", part="id,snippet", maxResults=1).execute()
+                    if ch_resp.get("items"):
+                        c_id = ch_resp["items"][0]["id"]["channelId"]
+                        c_title = ch_resp["items"][0]["snippet"]["title"]
+                        target_channel_ids.append(c_id)
+                        print(f"  - Resolved '{ch_name}' to {c_title} ({c_id})")
+                    else:
+                        print(f"  - Warning: Could not find channel matching '{ch_name}'")
+                except Exception as e:
+                    print(f"  - Error resolving channel '{ch_name}': {e}")
+            if not target_channel_ids:
+                print("Error: No provided include_channels could be resolved to a valid YouTube Channel ID. Exiting.")
+                return
+
+        video_ids = set()
+        # Prepare base search arguments. maxResults per page is capped at 50 by YouTube API.
+        raw_limit = 50 if self.enable_semantic_filter else min(max(self.max_results * 2, 10), 50)
+        search_kwargs_base = {
+            'part': "id",
+            'type': "video",
+            'maxResults': raw_limit,
+        }
+        
+        if self.region_code:
+            search_kwargs_base['regionCode'] = self.region_code
+        
+        if self.sort_by == 'date':
+            search_kwargs_base['order'] = 'date'
+        elif self.sort_by == 'viewCount':
+            search_kwargs_base['order'] = 'viewCount'
+             
+        if self.video_type == 'shorts':
+            search_kwargs_base['videoDuration'] = 'short'
+        
+        if self.published_after:
+            search_kwargs_base['publishedAfter'] = self.published_after
+
+        def fetch_pages(search_q, channel_id=None):
+            next_page_token = None
+            v_ids = set()
+            # Fetch deeper candidate pool when semantic filtering is enabled to guarantee sufficient relevant videos
+            if self.enable_semantic_filter:
+                target_raw = max(self.max_results * 3, 50)
+                max_pages = min((target_raw + 49) // 50, 3)
+            elif self.max_results <= 50:
+                max_pages = 1
+            else:
+                target_raw = (self.max_results * 3) // 2
+                max_pages = min((target_raw + 49) // 50, 4)
+            for _ in range(max_pages):
+                try:
+                    kwargs = search_kwargs_base.copy()
+                    kwargs["q"] = search_q
+                    kwargs["pageToken"] = next_page_token
+                    
+                    if channel_id:
+                        kwargs["channelId"] = channel_id
+                        
+                    search_response = self.youtube_api.search().list(**kwargs).execute()
+                    
+                    for item in search_response.get("items", []):
+                        if "videoId" in item.get("id", {}):
+                            v_ids.add(item["id"]["videoId"])
+                    
+                    next_page_token = search_response.get('nextPageToken')
+                    if not next_page_token:
+                        break # Exit if there are no more pages
+                except HttpError as e:
+                    print(f"An HTTP error {e.resp.status} occurred:\n{e.content}")
+                    raise e
+            return v_ids
+
+        # --- Global Query Cache Implementation (Strategy A) ---
+        key_dict = {
+            "terms": self.search_terms.lower() if self.search_terms else "",
+            "queries": sorted([q.lower() for q in getattr(self, 'search_queries', []) if q]),
+            "mods": sorted([m.lower() for m in self.search_modifiers if m]),
+            "exclude_keywords": sorted([k.lower() for k in self.exclude_keywords if k]),
+            "include_channels": sorted([c.lower() for c in getattr(self, 'include_channels', []) if c]),
+            "exclude_channels": sorted([c.lower() for c in getattr(self, 'exclude_channels', []) if c]),
+            "min_view_count": int(self.min_view_count),
+            "region": self.region_code.lower() if self.region_code else "",
+            "type": self.video_type.lower() if self.video_type else "",
+            "published_after": self.published_after if self.published_after else ""
+        }
+        query_hash = hashlib.md5(json.dumps(key_dict, sort_keys=True).encode('utf-8')).hexdigest()
+        
+        global_cache_dir = os.path.join(self.project_root, 'outputs', 'cache', 'youtube_queries')
+        os.makedirs(global_cache_dir, exist_ok=True)
+        global_cache_path = os.path.join(global_cache_dir, f"{query_hash}.json")
+        
+        cache_loaded = False
+        # Check if global query cache exists and is under 24 hours old (86400 seconds)
+        if os.path.exists(global_cache_path):
+            file_age = time.time() - os.path.getmtime(global_cache_path)
+            if file_age < 86400:
+                try:
+                    print(f"\n[CACHE HIT] Found global shared query cache at '{os.path.basename(global_cache_path)}' ({int(file_age/3600)}h old). Loading...")
+                    with open(global_cache_path, 'r', encoding='utf-8') as f:
+                        video_ids = set(json.load(f))
+                        cache_loaded = True
+                except Exception as e:
+                    print(f"Error loading global query cache: {e}. Falling back to fresh search.")
+            else:
+                print(f"\n[CACHE EXPIRED] Global shared query cache is {int(file_age/3600)}h old. Fetching fresh results...")
+
+        # If not loaded from global cache, run search
+        if not cache_loaded:
+            cache_file_path = os.path.join(self.output_dir, "search_cache.json")
+            
+            if os.path.exists(cache_file_path):
+                print(f"\nFound cached search results in '{cache_file_path}'. Loading...")
+                with open(cache_file_path, 'r', encoding='utf-8') as f:
+                    video_ids = set(json.load(f))
+            else:
+                if target_channel_ids:
+                    print(f"\nTargeting specific channels for videos...")
+                    for q in active_queries:
+                        for c_id in target_channel_ids:
+                            video_ids.update(fetch_pages(q, c_id))
+                else:
+                    print("\nSearching globally for videos...")
+                    for q in active_queries:
+                        video_ids.update(fetch_pages(q))
+                    
+                # Save to local session cache
+                with open(cache_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(list(video_ids), f)
+                print(f"Saved search results to local cache: '{cache_file_path}'")
+                
+                # Save to global shared cache
+                try:
+                    with open(global_cache_path, 'w', encoding='utf-8') as f:
+                        json.dump(list(video_ids), f)
+                    print(f"Saved search results to global shared cache: '{os.path.basename(global_cache_path)}'")
+                except Exception as e:
+                    print(f"Error saving to global query cache: {e}")
+
+        empty_cols = [
+            "video_id", "title", "url", "channel", "date", "views", "likes", "comments",
+            "engagement", "description", "duration", "published_at", "relevance_score",
+            "relevance_reason", "content_archetype"
+        ]
+
+        if not video_ids:
+            print("No videos found matching the search criteria. Exiting.")
+            print(f"Writing empty CSV with valid headers to '{self.output_path}' to protect downstream stages.")
+            pd.DataFrame(columns=empty_cols).to_csv(self.output_path, index=False)
+            return
+
+        print(f"\nFound {len(video_ids)} unique videos. Fetching details...")
+        video_details = self._get_video_details(list(video_ids))
+        
+        print("\nFiltering and processing video data...")
+        df = self._process_and_filter_videos(video_details)
+
+        if df.empty:
+            print(f"\n[WARNING] Zero videos passed the relevance threshold (>={self.relevance_threshold}).")
+            print(f"Writing empty CSV with valid headers to '{self.output_path}' to protect downstream stages.")
+            pd.DataFrame(columns=empty_cols).to_csv(self.output_path, index=False)
+            print("Consider broadening search queries or lowering relevance_threshold in config.ini.")
+            return
+
+        print(f"\nSorting results by '{self.sort_by}'...")
+        df = self._sort_results(df)
+
+        final_df = df.head(self.max_results)
+        final_df.to_csv(self.output_path, index=False)
+        
+        print(f"\n\nSUCCESS: Crawling complete! Saved {len(final_df)} videos to '{self.output_path}'.")
+
+    def _get_video_details(self, video_ids):
+        """Fetches detailed statistics for a list of video IDs in batches."""
+        video_details = []
+        # Process in batches of 50 (API limit)
+        for i in tqdm(range(0, len(video_ids), 50), desc="Fetching Video Details"):
+            batch_ids = video_ids[i:i+50]
+            try:
+                details_response = self.youtube_api.videos().list(
+                    part="snippet,statistics,contentDetails",
+                    id=",".join(batch_ids)
+                ).execute()
+                video_details.extend(details_response.get("items", []))
+            except HttpError as e:
+                print(f"An HTTP error {e.resp.status} occurred while fetching details:\n{e.content}")
+        return video_details
+
+    def _is_short_video(self, video_id):
+        """
+        Determines if a video is a YouTube Short by checking for redirection.
+        Returns True if it's a Short, False otherwise.
+        """
+        try:
+            url = f"https://www.youtube.com/shorts/{video_id}"
+            # We only need the headers, so use HEAD request.
+            # Allow redirects=False to check the status code directly.
+            response = requests.head(url, allow_redirects=False, timeout=5)
+            
+            # 200 OK means it resides at /shorts/, so it's a Short.
+            # 303 See Other (or 302) means it redirects to /watch, so it's a regular video.
+            return response.status_code == 200
+        except requests.RequestException:
+            # If verification fails (e.g. timeout), default to False or log warning.
+            # For robustness, we'll assume it's NOT a short if we can't verify.
+            return False
+
+    def _process_and_filter_videos(self, video_details):
+        """Processes the raw API response, filters it, and returns a DataFrame."""
+        empty_cols = [
+            "video_id", "title", "url", "channel", "date", "views", "likes", "comments",
+            "engagement", "description", "duration", "published_at", "relevance_score",
+            "relevance_reason", "content_archetype"
+        ]
+        
+        candidate_videos = []
+        desc = "Processing Videos"
+        if self.video_type != 'both':
+            desc += f" (Checking for {self.video_type})"
+
+        for video in tqdm(video_details, desc=desc):
+            vid_id = video.get("id", "")
+            snippet = video.get("snippet", {})
+            title = snippet.get("title", "")
+            channel_title = snippet.get("channelTitle", "")
+            published_at = snippet.get("publishedAt", "")
+            description = snippet.get("description", "")
+            tags = snippet.get("tags", [])
+            
+            # Filter by date (required when results are loaded from cache)
+            if self.published_after:
+                if pd.to_datetime(published_at) < pd.to_datetime(self.published_after):
+                    continue
+
+            stats = video.get("statistics", {})
+            view_count = int(stats.get("viewCount", 0))
+            
+            # Filter by minimum view count
+            if view_count < self.min_view_count:
+                continue
+
+            # Filter by video type (Shorts vs Videos) - Precise Check
+            if self.video_type != 'both':
+                is_short = self._is_short_video(vid_id)
+                if self.video_type == 'shorts' and not is_short:
+                    continue
+                if self.video_type == 'videos' and is_short:
+                    continue
+
+            like_count = int(stats.get("likeCount", 0))
+            comment_count = int(stats.get("commentCount", 0))
+            
+            candidate_videos.append({
+                "video_id": vid_id,
+                "title": title,
+                "url": f"https://www.youtube.com/watch?v={vid_id}",
+                "channel": channel_title,
+                "date": published_at,
+                "views": view_count,
+                "likes": like_count,
+                "comments": comment_count,
+                "engagement": like_count + comment_count,
+                "description": description,
+                "duration": video.get("contentDetails", {}).get("duration", ""),
+                "published_at": published_at,
+                "tags": tags
+            })
+        
+        if not candidate_videos:
+            return pd.DataFrame(columns=empty_cols)
+
+        if self.enable_semantic_filter:
+            relevance_filter = VideoRelevanceFilter(
+                config_path=self.config_path,
+                relevance_threshold=self.relevance_threshold
+            )
+            relevant_videos, rejected = relevance_filter.filter_videos(
+                video_details=candidate_videos,
+                campaign_objective=self.campaign_briefing,
+                additional_context=self.additional_context,
+                exclude_keywords=self.exclude_keywords,
+                exclude_channels=self.exclude_channels,
+                region_code=self.region_code,
+                threshold=self.relevance_threshold
+            )
+            if not relevant_videos:
+                return pd.DataFrame(columns=empty_cols)
+            return pd.DataFrame(relevant_videos)
+        else:
+            # Legacy deterministic filtering mode
+            filtered_videos = []
+            for cand in candidate_videos:
+                title = cand["title"]
+                channel_title = cand["channel"]
+                if any(keyword in title.lower() for keyword in self.exclude_keywords):
+                    continue
+                if self.exclude_channels and any(exc_ch in channel_title.lower() for exc_ch in self.exclude_channels):
+                    continue
+                cand["relevance_score"] = 100
+                cand["relevance_reason"] = "Semantic filter disabled"
+                cand["content_archetype"] = "N/A"
+                filtered_videos.append(cand)
+            if not filtered_videos:
+                return pd.DataFrame(columns=empty_cols)
+            return pd.DataFrame(filtered_videos)
+
+    def _sort_results(self, df):
+        """Sorts the DataFrame based on the configuration."""
+        if df.empty:
+            return df
+
+        if self.sort_by == 'viewCount':
+            return df.sort_values(by="views", ascending=False).reset_index(drop=True)
+        elif self.sort_by == 'engagement':
+            return df.sort_values(by="engagement", ascending=False).reset_index(drop=True)
+        elif self.sort_by == 'date':
+            df['parsed_date'] = pd.to_datetime(df['date'])
+            df = df.sort_values(by="parsed_date", ascending=False).reset_index(drop=True)
+            df = df.drop(columns=['parsed_date'])
+            return df
+        elif self.sort_by == 'relevance':
+            if 'relevance_score' in df.columns:
+                # Sort by AI relevance score descending, using engagement and views as tiebreakers
+                return df.sort_values(by=['relevance_score', 'engagement', 'views'], ascending=[False, False, False]).reset_index(drop=True)
+            return df
+        else: # Default to relevance
+            if 'relevance_score' in df.columns:
+                return df.sort_values(by=['relevance_score', 'engagement', 'views'], ascending=[False, False, False]).reset_index(drop=True)
+            return df
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="YouTube Brand Crawler")
+    parser.add_argument(
+        "--config",
+        default="config.ini",
+        help="Path to the configuration file."
+    )
+    args = parser.parse_args()
+
+    try:
+        crawler = YouTubeBrandCrawler(config_path=args.config)
+        crawler.run_crawler()
+    except (ValueError, FileNotFoundError) as e:
+        print(f"\nCRITICAL ERROR: {e}")

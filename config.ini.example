@@ -1,0 +1,62 @@
+[Crawler]
+# --- Configuration for the YouTube Brand Crawler ---
+search_terms = 
+search_modifiers = 
+# Optional: The 2-letter ISO country code (e.g., BR, US) to restrict search results to that region.
+region_code = BR
+exclude_keywords = 
+# Options: videos, shorts, both
+video_type = both
+# Filter videos published after a specific date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ). Leave empty for no date filter.
+published_after = 
+# Optional: Comma-separated list of channel names (case-insensitive) to exclusively search. Leave blank to allow all.
+include_channels = 
+# Optional: Comma-separated list of channel names (case-insensitive) to filter out of the results.
+exclude_channels = 
+min_view_count = 10000
+# Options: relevance, viewCount, engagement, date
+sort_by = relevance
+max_results = 10
+max_comments_per_video = 10
+# Enable AI Semantic Relevance Filtering (two-stage heuristic + LLM scoring)
+enable_semantic_filter = true
+# Minimum relevance score (0-100) for a video candidate to be kept
+relevance_threshold = 70
+# Campaign briefing or objective description used to score relevance
+campaign_briefing = 
+
+[AudioExtractor]
+# --- Configuration for the Audio Extractor ---
+audio_folder_name = audio
+
+[Analysis]
+# --- Configuration for the Gemini-Powered Analysis ---
+
+# Model for the final, high-level synthesis.
+pro_model_name = gemini-3.7-flash
+
+# Lighter model for summarizing individual batches.
+flash_model_name = gemini-3.7-flash
+
+# Fallback model in case primary models fail (e.g., 503 error).
+fallback_model_name = gemini-3.6-flash
+
+# Path to the prompt for the final report synthesis (Gemini Pro).
+pro_prompt_template_path = templates/prompts/topic_analysis.txt
+
+# Path to the prompt for summarizing batches (Gemini Flash).
+flash_prompt_template_path = templates/prompts/topic_flash.txt
+
+# Number of videos to process in a single batch.
+batch_size = 3
+
+# Directory to store intermediate analysis summaries.
+cache_dir = outputs/cache
+
+# The format for the final report. Options: html, markdown
+report_format = html
+
+
+# Path to the specific comments CSV file to analyze.
+# This is now read automatically based on the brand name.
+# comments_csv_path = outputs/Volkswagen_Tera/Volkswagen_Tera_raw_comments.csv

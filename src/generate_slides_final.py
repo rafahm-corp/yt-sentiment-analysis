@@ -1,0 +1,401 @@
+import os
+import json
+import configparser
+import re
+import time
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+from PIL import Image
+
+def call_gemini(prompt, model_name, fallback_model_name=None, config=None):
+    """Calls the Gemini API with retry logic for 503 errors and optional fallback."""
+    load_dotenv()
+    client = genai.Client()
+    
+    for attempt in range(3):
+        try:
+            print(f"Calling {model_name} (Attempt {attempt + 1})...", flush=True)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config
+            )
+            return response.text
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                print(f"Model {model_name} overloaded (503). Waiting 5 seconds to retry...", flush=True)
+                time.sleep(5)
+            else:
+                print(f"Error calling Gemini API ({model_name}): {e}", flush=True)
+                break
+                
+    if fallback_model_name:
+        print(f"Failed with primary model {model_name}. Falling back to {fallback_model_name}...", flush=True)
+        try:
+            response = client.models.generate_content(
+                model=fallback_model_name,
+                contents=prompt,
+                config=config
+            )
+            print(f"SUCCESS: Generated with fallback model {fallback_model_name}.", flush=True)
+            return response.text
+        except Exception as e_fb:
+            print(f"Error calling fallback Gemini API ({fallback_model_name}): {e_fb}", flush=True)
+            
+    print(f"Failed to get response.", flush=True)
+    return None
+
+def generate_image(prompt, output_path):
+    """Calls Gemini Image API (Nano Banana) to generate an image with retry."""
+    load_dotenv()
+    client = genai.Client()
+    
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-image-preview",
+                contents=[prompt],
+            )
+            
+            for part in response.parts:
+                if part.inline_data is not None:
+                    image = part.as_image()
+                    image.save(output_path)
+                    return True
+            return False
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                print(f"Image model overloaded (503). Waiting 5 seconds to retry...", flush=True)
+                time.sleep(5)
+            else:
+                print(f"Error generating image: {e}", flush=True)
+                return False
+    print("Failed to generate image after 3 attempts.", flush=True)
+    return False
+
+def run_slide_generation(config_path="config.ini"):
+    """Full workflow to generate slides content as JSON, images and HTML viewer."""
+    load_dotenv()
+    
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(config_path)
+    brand_name = config.get('Crawler', 'search_terms')
+    safe_brand_name = re.sub(r'\W+', '', brand_name.replace(' ', '_'))
+    run_id = config.get('General', 'run_id', fallback=safe_brand_name)
+    additional_context = config.get('Analysis', 'additional_context', fallback='')
+    output_language = config.get('Analysis', 'output_language', fallback='Portuguese')
+    
+    pro_model_name = config.get('Analysis', 'pro_model_name', fallback='gemini-3.7-flash')
+    flash_model_name = config.get('Analysis', 'flash_model_name', fallback='gemini-3.7-flash')
+    fallback_model_name = config.get('Analysis', 'fallback_model_name', fallback='gemini-3.6-flash')
+    
+    report_format = config.get('Analysis', 'report_format', fallback='html')
+    report_file = os.path.join("outputs", run_id, f"{safe_brand_name}_strategic_report.{report_format}")
+    output_dir = os.path.join("outputs", run_id, "presentation_structured")
+    images_dir = os.path.join(output_dir, "images_full")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    if not os.path.exists(report_file):
+        print(f"Error: Report file not found at {report_file}", flush=True)
+        return
+        
+    with open(report_file, 'r', encoding='utf-8') as f:
+        report_content = f.read()
+        
+    # STEP 1: Designer Agent - Generates the Template/Design System
+    designer_prompt = f"""
+    Você é o Designer Agent. Com base no conteúdo do relatório abaixo sobre '{brand_name}', 
+    gere um Design System completo para uma apresentação executiva.
+    
+    O output deve ser no formato YAML ou Markdown estruturado, contendo:
+    - Paleta de Cores (Hex codes)
+    - Tipografia (Fontes e tamanhos)
+    - Descrição do Estilo Visual
+    
+    Adapte o estilo ao tema do relatório!
+    
+    Relatório:
+    {report_content[:5000]}
+    """
+    
+    print("\n--- Gerando Template de Design ---", flush=True)
+    design_template = call_gemini(designer_prompt, flash_model_name, fallback_model_name) # Using Flash to avoid 503s
+    if not design_template:
+        return
+    print("SUCCESS: Template de Design gerado.", flush=True)
+        
+    # STEP 2: Slider Buddy - Generates content for EXACTLY 8 slides in JSON
+    slider_buddy_prompt_path = 'templates/prompts/slider_buddy.txt'
+    with open(slider_buddy_prompt_path, 'r', encoding='utf-8') as f:
+        slider_buddy_prompt_base = f.read()
+        
+    prompt_step2 = f"""
+    {slider_buddy_prompt_base}
+    
+    Instrução Específica: Gere o conteúdo para EXATAMENTE 8 slides.
+    Slide 1 deve ser sempre a Capa (Cover).
+    
+    Retorne o resultado APENAS como um JSON list de objetos. Não inclua markdown ou explicações fora do JSON.
+    Cada objeto deve ter a seguinte estrutura:
+    {{
+      "slide": 1,
+      "headline": "Título do slide",
+      "subtitle": "Subtítulo (opcional)",
+      "bullets": ["Tópico 1", "Tópico 2", ...],
+      "visual_description": "Descrição detalhada do visual e layout para este slide"
+    }}
+    
+    Conteúdo do Relatório:
+    {report_content[:5000]}
+    """
+    
+    if additional_context:
+        prompt_step2 += f"\n\nInformações/Diretrizes Adicionais do Usuário (PRIORIDADE MÁXIMA):\n{additional_context}"
+        prompt_step2 += "\nIMPORTANTE: Priorize as diretrizes adicionais do usuário acima sobre as regras do prompt original se houver conflito."
+        
+    prompt_step2 += f"\n\nIDIOMA DE SAÍDA: Toda a apresentação e textos devem ser gerados no idioma: {output_language}."
+    
+    print("\n--- Gerando Conteúdo dos Slides (JSON) ---", flush=True)
+    # Using JSON mode in config
+    json_config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+    )
+    
+    slides_json = call_gemini(prompt_step2, flash_model_name, fallback_model_name, config=json_config)
+    if not slides_json:
+        return
+        
+    try:
+        slides_list = json.loads(slides_json)
+        print("SUCCESS: Conteúdo dos slides gerado em JSON.", flush=True)
+        
+        # Validation Layer for JSON Content
+        print("\n--- Validando Conteúdo dos Slides com Gemini Pro ---", flush=True)
+        validation_prompt = f"""
+        Você é um Analista de Qualidade. Compare o conteúdo dos slides gerados (em JSON) com o relatório de origem.
+        
+        Regras de Validação:
+        1. Todas as informações nos slides devem estar presentes ou ser diretamente derivadas do relatório (sem alucinações).
+        2. O conteúdo deve ser relevante para o tema '{brand_name}'.
+        3. O idioma deve ser {output_language}.
+        4. O texto deve fazer sentido e estar gramaticalmente correto.
+        
+        JSON dos Slides:
+        {slides_json}
+        
+        Relatório de Origem:
+        {report_content[:5000]}
+        
+        Se o JSON estiver correto e alinhado, retorne APENAS a palavra 'VALID'.
+        Se houver erros ou desalinhamentos, retorne o JSON CORRIGIDO completo, mantendo a mesma estrutura.
+        """
+        
+        validation_result = call_gemini(validation_prompt, pro_model_name, fallback_model_name)
+        
+        if validation_result and 'VALID' not in validation_result:
+            print("Avisando: Ajustes sugeridos na validação. Atualizando conteúdo dos slides.", flush=True)
+            try:
+                # Try to parse the corrected JSON
+                start_idx = validation_result.find('[')
+                end_idx = validation_result.rfind(']') + 1
+                if start_idx != -1 and end_idx != 0:
+                    corrected_json = validation_result[start_idx:end_idx]
+                    slides_list = json.loads(corrected_json)
+                    slides_json = corrected_json # Update the string as well for saving
+                    print("SUCCESS: Slides corrigidos aplicados.", flush=True)
+            except Exception as e:
+                print(f"Erro ao processar JSON corrigido: {e}. Mantendo versão original.", flush=True)
+                
+    except Exception as e:
+        print(f"Error parsing JSON from Gemini: {e}", flush=True)
+        print(slides_json)
+        return
+        
+    # Save intermediate files
+    with open(os.path.join(output_dir, "template.yaml"), 'w', encoding='utf-8') as f:
+        f.write(design_template)
+    with open(os.path.join(output_dir, "slides_content.json"), 'w', encoding='utf-8') as f:
+        f.write(slides_json)
+        
+    # STEP 3: Loop to generate images (Parallel)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    print(f"\n--- Gerando Imagens para {len(slides_list)} slides (Paralelo) ---", flush=True)
+    
+    def process_slide(item):
+        slide_num = item.get('slide')
+        headline = item.get('headline')
+        bullets = item.get('bullets', [])
+        visual = item.get('visual_description')
+        
+        print(f"Processando Slide {slide_num}...", flush=True)
+        
+        # Construct prompt combining content and style
+        bullets_text = "\n".join([f"- {b}" for b in bullets])
+        
+        prompt_generator = f"""
+        Com base no seguinte Design System (Template) e no conteúdo deste slide,
+        gere um prompt detalhado e em INGLÊS para o gerador de imagens (Nano Banana).
+        O prompt deve descrever o slide inteiro como uma imagem completa, incluindo o título, subtítulo e bullets, seguindo o estilo do template.
+        Instrua o gerador de imagens a renderizar os textos claramente no idioma: {output_language}.
+        
+        CRITICAL INSTRUCTION: Do NOT render color names (e.g., 'Ouro Envelhecido', 'Azul Profundo'), color hex codes (e.g., '#B8860B', '#051C48'), or font names (e.g., 'Inter') as text on the image. Use them only as style instructions for colors and typography. The only text on the image should be the Title, Subtitle, and Bullets.
+        
+        Design System (Template):
+        {design_template}
+        
+        Conteúdo do Slide:
+        Título: {headline}
+        Texto: {bullets_text}
+        Descrição Visual: {visual}
+        
+        Retorne APENAS o texto do prompt.
+        """
+        
+        image_prompt = call_gemini(prompt_generator, flash_model_name, fallback_model_name)
+        if not image_prompt:
+            print(f"Falha ao gerar prompt para o Slide {slide_num}", flush=True)
+            return
+            
+        print(f"Prompt gerado para Slide {slide_num}: {image_prompt[:50]}...", flush=True)
+        
+        output_path = os.path.join(images_dir, f"slide_{slide_num}_full.png")
+        generate_image(image_prompt, output_path)
+        
+        # Image Validation Layer
+        print(f"Validando imagem do Slide {slide_num}...", flush=True)
+        
+        if os.path.exists(output_path):
+            try:
+                val_client = genai.Client()
+                img = Image.open(output_path)
+                
+                val_prompt = f"""
+                Você é um Revisor de Design. Verifique se a imagem gerada para o slide corresponde ao conteúdo esperado.
+                
+                Conteúdo Esperado:
+                Título: {headline}
+                Texto: {bullets_text}
+                
+                Verifique:
+                1. O texto na imagem está legível e correto?
+                2. A imagem é relevante para o conteúdo?
+                
+                Se a imagem estiver aceitável e o texto legível, retorne APENAS a palavra 'VALID'.
+                Se houver problemas graves (texto ilegível, conteúdo totalmente errado), retorne 'INVALID' e descreva brevemente o erro.
+                """
+                
+                val_response = val_client.models.generate_content(
+                    model=flash_model_name,
+                    contents=[img, val_prompt]
+                )
+                
+                print(f"Resultado da validação do Slide {slide_num}: {val_response.text}", flush=True)
+                
+                if 'INVALID' in val_response.text:
+                    print(f"Aviso: Imagem do Slide {slide_num} considerada inválida. Tentando gerar novamente...", flush=True)
+                    # Retry once
+                    generate_image(image_prompt, output_path)
+                    
+            except Exception as e:
+                print(f"Erro ao validar imagem do Slide {slide_num}: {e}", flush=True)
+        
+    # Use 3 workers to avoid overwhelming image rate limits
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(process_slide, item) for item in slides_list]
+        for future in as_completed(futures):
+            future.result()
+        
+    # STEP 4: Create HTML Viewer
+    print("\n--- Criando Visualizador HTML ---", flush=True)
+    output_html = os.path.join("outputs", run_id, f"{safe_brand_name}_deck.html")
+    
+    img_files = [f for f in os.listdir(images_dir) if f.endswith('.png')]
+    img_files.sort(key=lambda x: int(re.search(r'slide_(\d+)', x).group(1)) if re.search(r'slide_(\d+)', x) else 0)
+    
+    html_content = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deck - {safe_brand_name}</title>
+    <style>
+        body {{
+            font-family: 'Inter', sans-serif;
+            background-color: #08132a;
+            color: #d9e2ff;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+        }}
+        .container {{
+            max-width: 1000px;
+            margin: 0 auto;
+        }}
+        .slide {{
+            margin-bottom: 40px;
+            border: 1px solid #44474d;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }}
+        img {{
+            width: 100%;
+            height: auto;
+            display: block;
+        }}
+        h1 {{
+            color: #b9c7e4;
+            margin-bottom: 30px;
+            font-size: 2rem;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Apresentação de Slides (Rolagem Vertical)</h1>
+    """
+    
+    import base64
+    for img_file in img_files:
+        img_path = os.path.join(images_dir, img_file)
+        with open(img_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            
+        html_content += f"""
+        <div class="slide">
+            <img src="data:image/png;base64,{encoded_string}" alt="Slide">
+        </div>
+        """
+        
+    html_content += """
+    </div>
+</body>
+</html>
+    """
+    
+    with open(output_html, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print(f"SUCCESS: Saved HTML Deck to {output_html}", flush=True)
+    
+    # STEP 5: Create PDF
+    print("\n--- Criando PDF da Apresentação ---", flush=True)
+    output_pdf = os.path.join("outputs", run_id, f"{safe_brand_name}_presentation.pdf")
+    
+    images = [Image.open(os.path.join(images_dir, f)) for f in img_files if f.endswith('.png')]
+    rgb_images = []
+    for img in images:
+        if img.mode == 'RGBA':
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            rgb_images.append(background)
+        else:
+            rgb_images.append(img.convert('RGB'))
+            
+    if rgb_images:
+        rgb_images[0].save(output_pdf, save_all=True, append_images=rgb_images[1:])
+        print(f"SUCCESS: Saved PDF to {output_pdf}", flush=True)
+
+if __name__ == "__main__":
+    run_slide_generation()

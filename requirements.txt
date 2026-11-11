@@ -1,0 +1,14 @@
+google-generativeai
+google-api-python-client
+pandas
+python-dotenv
+tqdm
+markdown
+requests
+streamlit
+tabulate
+google-genai
+notebooklm-py[browser]
+python-pptx
+Pillow
+pydantic
